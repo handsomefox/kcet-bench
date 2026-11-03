@@ -52,6 +52,8 @@ The setting changes only at boot, and the first minutes after a boot are noisy. 
 
 Alternate the setting from boot to boot: off, on, off, on. Stop when each setting has at least 3 boots.
 
+Keep everything else the same for every boot: the power plan, Microsoft Defender real-time protection, and any other antivirus or filter driver. Filter drivers take most of the time in `syscall_deep`, so a change there hides the kernel stack protection cost.
+
 `run` refuses to start when memory integrity is not running, when the label does not match the system, or when the output file already exists. It pins to logical CPU 2 by default. To use another CPU, pass `--cpu <n>`, and use the same CPU for every run. CPU 0 is not allowed, because it handles most interrupts. On a CPU with performance and efficiency cores, pick a performance core.
 
 ## Compare the runs
