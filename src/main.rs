@@ -16,6 +16,11 @@ mod report;
     all(not(windows), not(test)),
     expect(dead_code, reason = "the Windows-only run command uses these")
 )]
+mod session;
+#[cfg_attr(
+    all(not(windows), not(test)),
+    expect(dead_code, reason = "the Windows-only run command uses these")
+)]
 mod stats;
 #[cfg_attr(
     all(not(windows), not(test)),
@@ -73,18 +78,11 @@ fn main() -> ExitCode {
     })
 }
 
-fn compare_files(files: &[std::path::PathBuf]) -> Result<String, String> {
-    let mut runs = Vec::with_capacity(files.len());
-    for path in files {
-        let display = path.display().to_string();
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{display}: {e}"))?;
-        let report = serde_json::from_str(&text).map_err(|e| format!("{display}: {e}"))?;
-        let loaded = compare::Loaded {
-            path: display,
-            report,
-        };
-        compare::check_schema(&loaded)?;
-        runs.push(loaded);
+fn compare_files(paths: &[std::path::PathBuf]) -> Result<String, String> {
+    let runs = session::load(paths)?;
+    if runs.is_empty() {
+        let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        return Err(format!("no run files in {}", names.join(", ")));
     }
     Ok(compare::render(&runs))
 }
@@ -96,11 +94,14 @@ fn run(args: &cli::RunArgs) -> Result<ExitCode, String> {
 
 #[cfg(not(windows))]
 fn run(_: &cli::RunArgs) -> Result<ExitCode, String> {
-    Err("run measures the Windows kernel, so it only works on Windows. Build with `make build` and run the .exe there".into())
+    Err(
+        "run measures the Windows kernel, so it only works on Windows. Run the Windows .exe there"
+            .into(),
+    )
 }
 
 /// Writes to stdout. A closed pipe is not worth a panic, so write errors are dropped.
-fn print_text(text: &str) {
+pub(crate) fn print_text(text: &str) {
     let _ = io::stdout().lock().write_all(text.as_bytes());
 }
 

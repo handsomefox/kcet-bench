@@ -5,9 +5,11 @@ mod sys;
 mod sysinfo;
 
 use std::ffi::c_void;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use windows_sys::Win32::System::Threading::{
     GetActiveProcessorCount, GetCurrentProcess, GetCurrentThread, HIGH_PRIORITY_CLASS,
@@ -17,11 +19,12 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::cli::RunArgs;
-use crate::eprint_line;
 use crate::guard;
-use crate::report::{Outcome, RunConfig, RunReport, SCHEMA_VERSION, SystemInfo, TestResult};
+use crate::report::{Label, Outcome, RunConfig, RunReport, SCHEMA_VERSION, SystemInfo, TestResult};
+use crate::session::{self, Slot};
 use crate::stats;
 use crate::tune::{self, Plan};
+use crate::{compare, eprint_line, print_text};
 use bench::{Bench, Spec};
 use sys::{last_error, qpc, qpc_frequency, size_u32};
 
@@ -29,100 +32,160 @@ use sys::{last_error, qpc, qpc_frequency, size_u32};
 const SETTLE_MS: u64 = 180_000;
 
 pub(crate) fn run(args: &RunArgs) -> Result<ExitCode, String> {
-    // Create the output first, so a bad path fails before minutes of measuring.
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&args.out)
-        .map_err(|e| format!("cannot create {}: {e}", args.out.display()))?;
-    let result = measure_all(args, &mut out);
-    if result.is_err() {
-        drop(out);
-        let _ = std::fs::remove_file(&args.out);
-    }
-    result
-}
-
-fn measure_all(args: &RunArgs, out: &mut File) -> Result<ExitCode, String> {
     // Query Device Guard before raising priority and pinning: PowerShell inherits the
     // process affinity mask, and it should not compete with the measurements later.
     let device_guard = sysinfo::device_guard()?;
-    guard::check_label(args.label, &device_guard)?;
+    let label = guard::resolve_label(args.label, &device_guard)?;
     let user_shadow_stack = sysinfo::user_shadow_stack()?;
     if user_shadow_stack {
         return Err("user-mode shadow stacks are on for this process (forced by policy?). They would add a user-mode cost, so only kernel stack protection may differ".into());
     }
+    std::fs::create_dir_all(&args.dir)
+        .map_err(|e| format!("cannot create {}: {e}", args.dir.display()))?;
 
-    let now = sysinfo::now();
-    if now.uptime_ms < SETTLE_MS {
-        eprint_line(&format!(
-            "warning: the system booted {} s ago; the protocol asks for 3 idle minutes first",
-            now.uptime_ms / 1000
-        ));
+    let (earlier, problems) = session::load_dir_lenient(&args.dir);
+    for problem in problems {
+        eprint_line(&format!("warning: skipping {problem}"));
     }
-    let system = SystemInfo {
-        timestamp: now.timestamp,
-        unix_time_ms: now.unix_time_ms,
-        uptime_ms: now.uptime_ms,
+    let start = sysinfo::now();
+    let boot_ms = start.unix_time_ms.saturating_sub(start.uptime_ms);
+    let slot = session::slot(&earlier, label, boot_ms);
+    warn_and_settle(&earlier, label, boot_ms, start.uptime_ms);
+
+    let fixed = FixedInfo {
         windows: sysinfo::windows_version()?,
         cpu_brand: sysinfo::cpu_brand(),
         cpu_shadow_stack_support: sysinfo::cpu_shadow_stack_support(),
         logical_cpus: sysinfo::logical_cpus(),
         power_scheme: sysinfo::power_scheme()?,
-        device_guard,
-        user_shadow_stack,
     };
-
     prepare_process(args.cpu)?;
     let plan = Plan::standard(qpc_frequency()?);
     eprint_line(&format!(
-        "kcet-bench {}: label {}, CPU {}, Windows {}, {}",
+        "kcet-bench {}: label {label} (detected), boot {}, CPU {}, Windows {}, {}",
         env!("CARGO_PKG_VERSION"),
-        args.label,
+        slot.boot,
         args.cpu,
-        system.windows,
-        system.cpu_brand
+        fixed.windows,
+        fixed.cpu_brand
     ));
 
-    let tests: Vec<TestResult> = bench::ALL
-        .iter()
-        .map(|spec| run_test(spec, &plan))
-        .collect();
-    let aborted = tests
-        .iter()
-        .filter(|t| matches!(t.outcome, Outcome::Aborted { .. }))
-        .count();
+    let mut aborted = 0;
+    for i in 0..args.runs {
+        eprint_line(&format!("run {} of {}", i + 1, args.runs));
+        let now = sysinfo::now();
+        let system = SystemInfo {
+            timestamp: now.timestamp,
+            unix_time_ms: now.unix_time_ms,
+            uptime_ms: now.uptime_ms,
+            windows: fixed.windows.clone(),
+            cpu_brand: fixed.cpu_brand.clone(),
+            cpu_shadow_stack_support: fixed.cpu_shadow_stack_support,
+            logical_cpus: fixed.logical_cpus,
+            power_scheme: fixed.power_scheme.clone(),
+            device_guard: device_guard.clone(),
+            user_shadow_stack,
+        };
+        let tests: Vec<TestResult> = bench::ALL
+            .iter()
+            .map(|spec| run_test(spec, &plan))
+            .collect();
+        aborted += tests
+            .iter()
+            .filter(|t| matches!(t.outcome, Outcome::Aborted { .. }))
+            .count();
+        let report = RunReport {
+            schema_version: SCHEMA_VERSION,
+            tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+            label,
+            system,
+            config: RunConfig {
+                cpu: args.cpu,
+                qpc_frequency: plan.freq,
+                warmup_batches: plan.warmup_batches,
+                batches: plan.batches,
+                batch_min_ms: plan.min_ms,
+                batch_target_ms: plan.target_ms,
+                batch_max_ms: plan.max_ms,
+            },
+            tests,
+        };
+        let path = write_new(&args.dir, label, &slot, i, &report)?;
+        eprint_line(&format!("wrote {}", path.display()));
+    }
 
-    let report = RunReport {
-        schema_version: SCHEMA_VERSION,
-        tool_version: env!("CARGO_PKG_VERSION").to_owned(),
-        label: args.label,
-        system,
-        config: RunConfig {
-            cpu: args.cpu,
-            qpc_frequency: plan.freq,
-            warmup_batches: plan.warmup_batches,
-            batches: plan.batches,
-            batch_min_ms: plan.min_ms,
-            batch_target_ms: plan.target_ms,
-            batch_max_ms: plan.max_ms,
-        },
-        tests,
-    };
-    let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-    out.write_all(json.as_bytes())
-        .and_then(|()| out.write_all(b"\n"))
-        .and_then(|()| out.sync_all())
-        .map_err(|e| format!("cannot write {}: {e}", args.out.display()))?;
-    eprint_line(&format!("wrote {}", args.out.display()));
-
+    let (all, _) = session::load_dir_lenient(&args.dir);
+    print_text(&format!(
+        "\n{}\n{}",
+        compare::render(&all),
+        session::next_step(&all, label)
+    ));
     if aborted > 0 {
         eprint_line(&format!(
-            "error: {aborted} test(s) aborted; their numbers are not in the file"
+            "error: {aborted} test run(s) aborted; their numbers are not in the files"
         ));
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Warns about protocol slips the tool can see, and waits out the 3 idle minutes after boot.
+fn warn_and_settle(earlier: &[compare::Loaded], label: Label, boot_ms: u64, uptime_ms: u64) {
+    if session::previous_boot_label(earlier, boot_ms) == Some(label) {
+        eprint_line(&format!(
+            "warning: the previous boot was also {label}; the protocol alternates off and on"
+        ));
+    }
+    let vms = sysinfo::running_vm_processes();
+    if !vms.is_empty() {
+        eprint_line(&format!(
+            "warning: a virtual machine is running ({}). Run `wsl --shutdown` and stop other VMs first",
+            vms.join(", ")
+        ));
+    }
+    if uptime_ms < SETTLE_MS {
+        let wait = SETTLE_MS - uptime_ms;
+        eprint_line(&format!(
+            "waiting {} s, so the system has been up for 3 minutes before measuring",
+            wait.div_ceil(1000)
+        ));
+        std::thread::sleep(Duration::from_millis(wait));
+    }
+}
+
+/// System details that do not change between the runs of one invocation.
+struct FixedInfo {
+    windows: crate::report::WindowsVersion,
+    cpu_brand: String,
+    cpu_shadow_stack_support: bool,
+    logical_cpus: u32,
+    power_scheme: crate::report::PowerScheme,
+}
+
+/// Writes `report` to the first free `<label>-boot<n>-run<n>.json` name for this run.
+/// An existing file is never overwritten.
+fn write_new(
+    dir: &Path,
+    label: Label,
+    slot: &Slot,
+    index: usize,
+    report: &RunReport,
+) -> Result<PathBuf, String> {
+    let json = serde_json::to_string_pretty(report).map_err(|e| e.to_string())? + "\n";
+    let mut run = slot.first_run + index;
+    loop {
+        let path = dir.join(Slot::file_name(label, slot.boot, run));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(json.as_bytes())
+                    .and_then(|()| file.sync_all())
+                    .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => run += 1,
+            Err(e) => return Err(format!("cannot create {}: {e}", path.display())),
+        }
+    }
 }
 
 /// Raises the priority class, opts out of power throttling, and pins the process (and with

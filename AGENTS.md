@@ -6,7 +6,7 @@ The [README](README.md) covers what kcet-bench measures, how to build it, and th
 
 One binary, split so that everything portable is testable on Linux:
 
-- `src/cli.rs`, `src/compare.rs`, `src/guard.rs`, `src/report.rs`, `src/stats.rs`, and `src/tune.rs` are portable. They hold argument parsing, the comparison and its noise rule, the Device Guard parser and label rule, the JSON model, the order statistics, and the batch-sizing loop.
+- `src/cli.rs`, `src/compare.rs`, `src/guard.rs`, `src/report.rs`, `src/session.rs`, `src/stats.rs`, and `src/tune.rs` are portable. They hold argument parsing, the comparison and its noise rule, the Device Guard parser and label rule, the JSON model, the results folder (file names, boot numbers, and the next protocol step), the order statistics, and the batch-sizing loop.
 - `src/win/` is Windows-only, behind `cfg(windows)`. `bench.rs` holds the measured operations, `sysinfo.rs` the system description, `sys.rs` the shared Win32 wrappers, and `mod.rs` the `run` command.
 
 Put logic that does not call Windows in a portable module, so that it gets a unit test on Linux.
@@ -19,7 +19,8 @@ A number in a run file is a claim about the kernel. Keep every rule that makes i
 - `Bench::batch` holds the operation, its result check, and the loop counter, and nothing else. No allocation, formatting, `std::thread`, or extra system calls inside the loop, except on the error path.
 - Check every result inside the loop. An unexpected result returns an error, which aborts the test and keeps its numbers out of the file. `kernel_seh` must see `STATUS_ACCESS_VIOLATION` on every call.
 - `run` raises the process to `HIGH_PRIORITY_CLASS`, opts out of power throttling, and pins the process affinity mask to one CPU, so threads created later stay on that CPU. CPU 0 is never allowed.
-- `run` queries Device Guard before it raises priority or pins, so PowerShell does not inherit either. HVCI must run under both labels, and kernel stack protection (5) must run exactly when the label is `on`. Audit mode (6) fits neither label.
+- `run` queries Device Guard before it raises priority or pins, so PowerShell does not inherit either. HVCI must run under both labels. The label is `on` exactly when kernel stack protection (5) runs, and comes from Windows, never from the user alone. Audit mode (6) fits neither label.
+- `run` waits until the system has been up for 3 minutes before it measures.
 - Batches take 20-50 ms, timed with `QueryPerformanceCounter` around the whole batch, never around one operation.
 - `run` never overwrites an output file.
 
@@ -31,7 +32,7 @@ Unit tests live beside their implementations in `#[cfg(test)]` modules. Cover th
 
 The tests in `src/win/bench.rs` call the real kernel paths, and CI's Windows job runs them. They share one process, so they must never change priority or affinity.
 
-CI cannot reach the parts that need a configured machine. Exercise these by hand on Windows: a full `run` under each label, the refusal when the label does not match, and `compare` over the files.
+CI cannot reach the parts that need a configured machine. Exercise these by hand on Windows: a full `run` under each label, a second `run` in the same boot (its run numbers continue), the refusal when `--label` does not match, and `compare` over the results folder.
 
 ## Bump CI tool pins by hand
 

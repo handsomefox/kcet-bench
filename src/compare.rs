@@ -10,7 +10,7 @@ use crate::stats;
 /// derived from wall clock minus uptime, so clock adjustments make it drift a little.
 const SAME_BOOT_MS: u64 = 120_000;
 /// The run protocol asks for at least this many boots per label.
-const MIN_BOOTS: usize = 3;
+pub(crate) const MIN_BOOTS: usize = 3;
 
 /// One label's results for one test.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,19 +69,31 @@ pub(crate) fn delta_percent(off: &LabelStats, on: &LabelStats) -> f64 {
     (on.median - off.median) / off.median * 100.0
 }
 
-/// Number of distinct boots among the given boot times (Unix ms).
-pub(crate) fn count_boots(boot_times: &[u64]) -> usize {
+/// Groups boot times (Unix ms) into boots, oldest first. Times closer than
+/// `SAME_BOOT_MS` to the previous time belong to the same boot.
+pub(crate) fn boot_clusters(boot_times: &[u64]) -> Vec<Vec<u64>> {
     let mut sorted = boot_times.to_vec();
     sorted.sort_unstable();
-    let mut boots = 0;
-    let mut last: Option<u64> = None;
+    let mut clusters: Vec<Vec<u64>> = Vec::new();
     for t in sorted {
-        if last.is_none_or(|l| t - l > SAME_BOOT_MS) {
-            boots += 1;
+        match clusters.last_mut() {
+            Some(cluster) if cluster.last().is_some_and(|&l| t - l <= SAME_BOOT_MS) => {
+                cluster.push(t);
+            }
+            _ => clusters.push(vec![t]),
         }
-        last = Some(t);
     }
-    boots
+    clusters
+}
+
+/// Whether two boot times (Unix ms) belong to the same boot.
+pub(crate) fn same_boot(a: u64, b: u64) -> bool {
+    a.abs_diff(b) <= SAME_BOOT_MS
+}
+
+/// Number of distinct boots among the given boot times (Unix ms).
+pub(crate) fn count_boots(boot_times: &[u64]) -> usize {
+    boot_clusters(boot_times).len()
 }
 
 /// A run file that has been loaded.
@@ -279,12 +291,78 @@ pub(crate) fn render(runs: &[Loaded]) -> String {
     out
 }
 
+/// A run file with fixed system details, for tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) fn fake_run(label: Label, boot_ms: u64, medians: &[(&str, Option<f64>)]) -> Loaded {
     use crate::guard::DeviceGuard;
     use crate::report::{PowerScheme, RunConfig, SystemInfo, TestResult, WindowsVersion};
     use crate::stats::Summary;
+
+    let tests = medians
+        .iter()
+        .map(|&(name, m)| TestResult {
+            name: name.into(),
+            outcome: match m {
+                Some(m) => Outcome::Ok {
+                    unit: "call".into(),
+                    ops_per_batch: 1000,
+                    median_batch_ms: 30.0,
+                    batches_outside_window: 0,
+                    ns_per_unit: Summary {
+                        median: m,
+                        p5: m,
+                        p95: m,
+                        min: m,
+                    },
+                    batch_ns_per_unit: vec![m],
+                },
+                None => Outcome::Aborted { reason: "x".into() },
+            },
+        })
+        .collect();
+    Loaded {
+        path: format!("{label}.json"),
+        report: RunReport {
+            schema_version: SCHEMA_VERSION,
+            tool_version: "0.1.0".into(),
+            label,
+            system: SystemInfo {
+                timestamp: String::new(),
+                unix_time_ms: boot_ms + 600_000,
+                uptime_ms: 600_000,
+                windows: WindowsVersion {
+                    major: 10,
+                    minor: 0,
+                    build: 26100,
+                    ubr: Some(1),
+                },
+                cpu_brand: "cpu".into(),
+                cpu_shadow_stack_support: true,
+                logical_cpus: 8,
+                power_scheme: PowerScheme::from_guid("381b4222-f694-41f0-9685-ff5bb260df2e".into()),
+                device_guard: DeviceGuard {
+                    security_services_running: vec![2],
+                    virtualization_based_security_status: 2,
+                },
+                user_shadow_stack: false,
+            },
+            config: RunConfig {
+                cpu: 2,
+                qpc_frequency: 10_000_000,
+                warmup_batches: 5,
+                batches: 50,
+                batch_min_ms: 20,
+                batch_target_ms: 35,
+                batch_max_ms: 50,
+            },
+            tests,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     fn stats(medians: &[f64]) -> LabelStats {
         LabelStats::from_run_medians(medians).unwrap()
@@ -333,74 +411,9 @@ mod tests {
         );
     }
 
-    fn run(label: Label, boot_ms: u64, medians: &[(&str, Option<f64>)]) -> Loaded {
-        let tests = medians
-            .iter()
-            .map(|&(name, m)| TestResult {
-                name: name.into(),
-                outcome: match m {
-                    Some(m) => Outcome::Ok {
-                        unit: "call".into(),
-                        ops_per_batch: 1000,
-                        median_batch_ms: 30.0,
-                        batches_outside_window: 0,
-                        ns_per_unit: Summary {
-                            median: m,
-                            p5: m,
-                            p95: m,
-                            min: m,
-                        },
-                        batch_ns_per_unit: vec![m],
-                    },
-                    None => Outcome::Aborted { reason: "x".into() },
-                },
-            })
-            .collect();
-        Loaded {
-            path: format!("{label}.json"),
-            report: RunReport {
-                schema_version: SCHEMA_VERSION,
-                tool_version: "0.1.0".into(),
-                label,
-                system: SystemInfo {
-                    timestamp: String::new(),
-                    unix_time_ms: boot_ms + 600_000,
-                    uptime_ms: 600_000,
-                    windows: WindowsVersion {
-                        major: 10,
-                        minor: 0,
-                        build: 26100,
-                        ubr: Some(1),
-                    },
-                    cpu_brand: "cpu".into(),
-                    cpu_shadow_stack_support: true,
-                    logical_cpus: 8,
-                    power_scheme: PowerScheme::from_guid(
-                        "381b4222-f694-41f0-9685-ff5bb260df2e".into(),
-                    ),
-                    device_guard: DeviceGuard {
-                        security_services_running: vec![2],
-                        virtualization_based_security_status: 2,
-                    },
-                    user_shadow_stack: false,
-                },
-                config: RunConfig {
-                    cpu: 2,
-                    qpc_frequency: 10_000_000,
-                    warmup_batches: 5,
-                    batches: 50,
-                    batch_min_ms: 20,
-                    batch_target_ms: 35,
-                    batch_max_ms: 50,
-                },
-                tests,
-            },
-        }
-    }
-
     #[test]
     fn run_file_round_trips_through_json() {
-        let original = run(Label::On, 5_000, &[("a", Some(123.25)), ("b", None)]).report;
+        let original = fake_run(Label::On, 5_000, &[("a", Some(123.25)), ("b", None)]).report;
         let json = serde_json::to_string_pretty(&original).unwrap();
         let parsed: RunReport = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.label, Label::On);
@@ -414,9 +427,9 @@ mod tests {
     #[test]
     fn groups_by_label() {
         let runs = [
-            run(Label::On, 0, &[]),
-            run(Label::Off, 0, &[]),
-            run(Label::On, 0, &[]),
+            fake_run(Label::On, 0, &[]),
+            fake_run(Label::Off, 0, &[]),
+            fake_run(Label::On, 0, &[]),
         ];
         let g = group(&runs);
         assert_eq!(g[&Label::On].len(), 2);
@@ -426,14 +439,14 @@ mod tests {
     #[test]
     fn render_skips_aborted_runs_and_flags_noise() {
         let runs = [
-            run(Label::Off, 0, &[("a", Some(100.0)), ("b", Some(50.0))]),
-            run(Label::Off, 10_000_000, &[("a", Some(101.0)), ("b", None)]),
-            run(
+            fake_run(Label::Off, 0, &[("a", Some(100.0)), ("b", Some(50.0))]),
+            fake_run(Label::Off, 10_000_000, &[("a", Some(101.0)), ("b", None)]),
+            fake_run(
                 Label::On,
                 20_000_000,
                 &[("a", Some(110.0)), ("b", Some(50.5))],
             ),
-            run(
+            fake_run(
                 Label::On,
                 30_000_000,
                 &[("a", Some(111.0)), ("b", Some(51.0))],
@@ -456,10 +469,10 @@ mod tests {
 
     #[test]
     fn warns_about_mixed_settings() {
-        let mut other = run(Label::On, 0, &[]);
+        let mut other = fake_run(Label::On, 0, &[]);
         other.report.config.cpu = 4;
         other.report.system.windows.ubr = Some(2);
-        let runs = [run(Label::Off, 0, &[]), other];
+        let runs = [fake_run(Label::Off, 0, &[]), other];
         let warnings = consistency_warnings(&runs);
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("10.0.26100.1, 10.0.26100.2"));

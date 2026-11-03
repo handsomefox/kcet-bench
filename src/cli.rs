@@ -1,32 +1,41 @@
-//! Command-line parsing. No framework: there are two commands and three flags.
+//! Command-line parsing. No framework: there are two commands and four flags.
 
 use std::path::PathBuf;
 
 use crate::report::Label;
+use crate::session::DEFAULT_DIR;
 
 /// The logical CPU measuring threads are pinned to unless `--cpu` says otherwise.
 pub(crate) const DEFAULT_CPU: u32 = 2;
+/// Runs per boot unless `--runs` says otherwise. The run protocol asks for 3.
+pub(crate) const DEFAULT_RUNS: usize = 3;
+const MAX_RUNS: usize = 20;
 
 pub(crate) const USAGE: &str = "\
 kcet-bench: measures what Windows kernel-mode hardware-enforced stack protection costs
 
 Usage:
-  kcet-bench run --label <on|off> --out <file.json> [--cpu <n>]
-  kcet-bench compare <file.json>...
+  kcet-bench run [--runs <n>] [--dir <folder>] [--cpu <n>] [--label <on|off>]
+  kcet-bench compare [<file or folder>...]
   kcet-bench --help | --version
 
-run      Measure every test once and write the results to a new JSON file.
-         --label  The kernel stack protection setting this boot runs with. The run
-                  refuses to start when the label does not match the system.
-         --out    The file to create. An existing file is never overwritten.
+run      Measure every test 3 times and write each run to its own JSON file, named
+         <label>-boot<n>-run<n>.json. The label comes from the Device Guard state,
+         and the boot and run numbers continue from the files already in the folder.
+         Afterwards, print the comparison so far and the next step of the protocol.
+         --runs   Runs in this boot (default 3).
+         --dir    Results folder (default results). It is created when missing.
          --cpu    Logical CPU to pin every measuring thread to (default 2, never 0).
-compare  Group run files by label and report each test's delta and noise.
+         --label  Refuse to run unless the system has this setting.
+compare  Group run files by label and report each test's delta and noise. A folder
+         stands for every .json file in it (default results).
 ";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RunArgs {
-    pub(crate) label: Label,
-    pub(crate) out: PathBuf,
+    pub(crate) label: Option<Label>,
+    pub(crate) dir: PathBuf,
+    pub(crate) runs: usize,
     pub(crate) cpu: u32,
 }
 
@@ -48,10 +57,10 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
         "run" => parse_run(rest).map(Command::Run),
         "compare" => {
             if let Some(flag) = rest.iter().find(|a| a.starts_with('-')) {
-                return Err(format!("compare takes only file names, got {flag}"));
+                return Err(format!("compare takes only files and folders, got {flag}"));
             }
             if rest.is_empty() {
-                return Err("compare needs at least one result file".into());
+                return Ok(Command::Compare(vec![PathBuf::from(DEFAULT_DIR)]));
             }
             Ok(Command::Compare(rest.iter().map(PathBuf::from).collect()))
         }
@@ -61,7 +70,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, String> {
 
 fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     let mut label = None;
-    let mut out = None;
+    let mut dir = None;
+    let mut runs = None;
     let mut cpu = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -73,7 +83,16 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                     .ok_or_else(|| format!("--label must be on or off, got {v:?}"))?;
                 set_once(&mut label, parsed, flag)?;
             }
-            "--out" => set_once(&mut out, PathBuf::from(value()?), flag)?,
+            "--dir" => set_once(&mut dir, PathBuf::from(value()?), flag)?,
+            "--runs" => {
+                let v = value()?;
+                let n: usize = v
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=MAX_RUNS).contains(n))
+                    .ok_or_else(|| format!("--runs must be 1 to {MAX_RUNS}, got {v:?}"))?;
+                set_once(&mut runs, n, flag)?;
+            }
             "--cpu" => {
                 let v = value()?;
                 let n: u32 = v
@@ -90,8 +109,9 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
         }
     }
     Ok(RunArgs {
-        label: label.ok_or("run needs --label on|off")?,
-        out: out.ok_or("run needs --out <file.json>")?,
+        label,
+        dir: dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DIR)),
+        runs: runs.unwrap_or(DEFAULT_RUNS),
         cpu: cpu.unwrap_or(DEFAULT_CPU),
     })
 }
@@ -112,21 +132,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_run() {
+    fn run_needs_no_flags() {
         assert_eq!(
-            parse(&args("run --label on --out a.json")).unwrap(),
+            parse(&args("run")).unwrap(),
             Command::Run(RunArgs {
-                label: Label::On,
-                out: "a.json".into(),
-                cpu: DEFAULT_CPU
+                label: None,
+                dir: DEFAULT_DIR.into(),
+                runs: DEFAULT_RUNS,
+                cpu: DEFAULT_CPU,
             })
         );
+    }
+
+    #[test]
+    fn parses_run_flags() {
         assert_eq!(
-            parse(&args("run --cpu 6 --out b.json --label off")).unwrap(),
+            parse(&args("run --cpu 6 --dir D:\\bench --runs 5 --label off")).unwrap(),
             Command::Run(RunArgs {
-                label: Label::Off,
-                out: "b.json".into(),
-                cpu: 6
+                label: Some(Label::Off),
+                dir: "D:\\bench".into(),
+                runs: 5,
+                cpu: 6,
             })
         );
     }
@@ -134,14 +160,15 @@ mod tests {
     #[test]
     fn rejects_bad_run_flags() {
         for bad in [
+            "run --label maybe",
+            "run --cpu 0",
+            "run --cpu x",
+            "run --runs 0",
+            "run --runs 21",
+            "run --runs many",
+            "run --label on --label off",
+            "run --dir",
             "run --out a.json",
-            "run --label on",
-            "run --label maybe --out a.json",
-            "run --label on --out a.json --cpu 0",
-            "run --label on --out a.json --cpu x",
-            "run --label on --label off --out a.json",
-            "run --label on --out",
-            "run --label on --out a.json --fast",
         ] {
             assert!(parse(&args(bad)).is_err(), "{bad}");
         }
@@ -150,10 +177,13 @@ mod tests {
     #[test]
     fn parses_compare_and_help() {
         assert_eq!(
-            parse(&args("compare a.json b.json")).unwrap(),
-            Command::Compare(vec!["a.json".into(), "b.json".into()])
+            parse(&args("compare a.json results")).unwrap(),
+            Command::Compare(vec!["a.json".into(), "results".into()])
         );
-        assert!(parse(&args("compare")).is_err());
+        assert_eq!(
+            parse(&args("compare")).unwrap(),
+            Command::Compare(vec![DEFAULT_DIR.into()])
+        );
         assert!(parse(&args("compare --all")).is_err());
         assert_eq!(parse(&[]).unwrap(), Command::Help);
         assert_eq!(parse(&args("--help")).unwrap(), Command::Help);

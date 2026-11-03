@@ -56,9 +56,11 @@ pub(crate) fn parse(output: &str) -> Result<DeviceGuard, String> {
     })
 }
 
-/// Refuses a run unless HVCI runs in both configurations and kernel stack protection is
-/// enforced exactly when the label is `on`.
-pub(crate) fn check_label(label: Label, dg: &DeviceGuard) -> Result<(), String> {
+/// Works out the label from the Device Guard state, and refuses a run unless HVCI runs
+/// (both configurations need it) and kernel stack protection is either enforced or off.
+///
+/// With `expected`, the run also refuses when the system does not match it.
+pub(crate) fn resolve_label(expected: Option<Label>, dg: &DeviceGuard) -> Result<Label, String> {
     let running = |v| dg.security_services_running.contains(&v);
     if dg.virtualization_based_security_status != VBS_RUNNING {
         return Err(format!(
@@ -76,14 +78,16 @@ pub(crate) fn check_label(label: Label, dg: &DeviceGuard) -> Result<(), String> 
             "kernel stack protection is in audit mode ({KERNEL_STACK_PROTECTION_AUDIT}): shadow stacks are active, so the run fits neither label"
         ));
     }
-    match (label, running(KERNEL_STACK_PROTECTION)) {
-        (Label::On, false) => Err(format!(
-            "label is \"on\" but kernel stack protection ({KERNEL_STACK_PROTECTION}) is not running"
+    let actual = if running(KERNEL_STACK_PROTECTION) {
+        Label::On
+    } else {
+        Label::Off
+    };
+    match expected {
+        Some(expected) if expected != actual => Err(format!(
+            "--label is \"{expected}\" but kernel stack protection ({KERNEL_STACK_PROTECTION}) is {actual}"
         )),
-        (Label::Off, true) => Err(format!(
-            "label is \"off\" but kernel stack protection ({KERNEL_STACK_PROTECTION}) is running"
-        )),
-        _ => Ok(()),
+        _ => Ok(actual),
     }
 }
 
@@ -123,26 +127,32 @@ mod tests {
     }
 
     #[test]
-    fn label_must_match_kernel_stack_protection() {
-        assert!(check_label(Label::On, &dg(&[2, 5])).is_ok());
-        assert!(check_label(Label::Off, &dg(&[2])).is_ok());
-        assert!(check_label(Label::Off, &dg(&[1, 2, 7])).is_ok());
-        assert!(check_label(Label::On, &dg(&[2])).is_err());
-        assert!(check_label(Label::Off, &dg(&[2, 5])).is_err());
+    fn label_follows_kernel_stack_protection() {
+        assert_eq!(resolve_label(None, &dg(&[2, 5])), Ok(Label::On));
+        assert_eq!(resolve_label(None, &dg(&[2])), Ok(Label::Off));
+        assert_eq!(resolve_label(None, &dg(&[1, 2, 7])), Ok(Label::Off));
+    }
+
+    #[test]
+    fn expected_label_must_match() {
+        assert_eq!(resolve_label(Some(Label::On), &dg(&[2, 5])), Ok(Label::On));
+        assert_eq!(resolve_label(Some(Label::Off), &dg(&[2])), Ok(Label::Off));
+        assert!(resolve_label(Some(Label::On), &dg(&[2])).is_err());
+        assert!(resolve_label(Some(Label::Off), &dg(&[2, 5])).is_err());
     }
 
     #[test]
     fn hvci_is_required() {
-        assert!(check_label(Label::On, &dg(&[5])).is_err());
-        assert!(check_label(Label::Off, &dg(&[])).is_err());
+        assert!(resolve_label(None, &dg(&[5])).is_err());
+        assert!(resolve_label(None, &dg(&[])).is_err());
     }
 
     #[test]
     fn audit_mode_and_stopped_vbs_are_refused() {
-        assert!(check_label(Label::On, &dg(&[2, 6])).is_err());
-        assert!(check_label(Label::Off, &dg(&[2, 6])).is_err());
+        assert!(resolve_label(None, &dg(&[2, 6])).is_err());
+        assert!(resolve_label(None, &dg(&[2, 5, 6])).is_err());
         let mut d = dg(&[2, 5]);
         d.virtualization_based_security_status = 1;
-        assert!(check_label(Label::On, &d).is_err());
+        assert!(resolve_label(None, &d).is_err());
     }
 }

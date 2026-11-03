@@ -5,8 +5,12 @@ use std::process::Command;
 use std::ptr;
 
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::{
     ERROR_SUCCESS, FILETIME, LocalFree, STATUS_SUCCESS, SYSTEMTIME,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Power::PowerGetActiveScheme;
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
@@ -19,9 +23,10 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::core::GUID;
 
-use super::sys::{last_error, size_u32, wide};
+use super::sys::{Handle, last_error, size_u32, wide};
 use crate::guard::{self, DeviceGuard};
 use crate::report::{self, PowerScheme, WindowsVersion};
+use crate::session;
 
 /// Wall-clock time and uptime, read together.
 pub(crate) struct Now {
@@ -184,4 +189,38 @@ pub(crate) fn device_guard() -> Result<DeviceGuard, String> {
         ));
     }
     guard::parse(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Names of running virtual machine processes, such as `vmmemWSL` while WSL2 runs. An
+/// empty list also covers a failed process snapshot, because this only feeds a warning.
+pub(crate) fn running_vm_processes() -> Vec<String> {
+    // SAFETY: TH32CS_SNAPPROCESS with process ID 0 snapshots every process.
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let Ok(snapshot) = Handle::new(raw, "CreateToolhelp32Snapshot") else {
+        return Vec::new();
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_u32::<PROCESSENTRY32W>(),
+        ..Default::default()
+    };
+    let mut names: Vec<String> = Vec::new();
+    // SAFETY: `snapshot` is open and `entry` has its size field set.
+    let mut more = unsafe { Process32FirstW(snapshot.raw(), &raw mut entry) };
+    while more != 0 {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+        if session::is_vm_process(&name) && !names.contains(&name) {
+            names.push(name);
+        }
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot.raw(), &raw mut entry) };
+    }
+    names
 }

@@ -37,34 +37,40 @@ The setting changes only at boot, and the first minutes after a boot are noisy. 
 
 1. Open **Windows Security** > **Device security** > **Core isolation details**. Turn **Kernel-mode Hardware-enforced Stack Protection** on or off, and leave **Memory integrity** on.
 2. Restart Windows.
-3. After you sign in, leave the PC idle for 3 minutes.
-4. Run `wsl --shutdown`, so the WSL virtual machine stops using CPU time.
-5. Close every other app.
-6. Open an elevated PowerShell in the folder that holds `kcet-bench.exe`, and run the tool 3 times:
+3. Run `wsl --shutdown`, so the WSL virtual machine stops using CPU time.
+4. Close every other app.
+5. Open PowerShell in the folder that holds `kcet-bench.exe`, and run:
 
     ```powershell
-    .\kcet-bench.exe run --label off --out off-boot1-run1.json
-    .\kcet-bench.exe run --label off --out off-boot1-run2.json
-    .\kcet-bench.exe run --label off --out off-boot1-run3.json
+    .\kcet-bench.exe run
     ```
 
-    Use `--label on` while the feature is on.
+`run` reads the setting from Windows, so there is no label to type. If Windows booted less than 3 minutes ago, it waits until 3 minutes have passed. It then measures every test 3 times and writes each run to its own file in the `results` folder, such as `results\off-boot2-run1.json`. The boot and run numbers continue from the files already there. At the end it prints the comparison so far and the next step: which way to turn the setting before the next restart.
 
-Alternate the setting from boot to boot: off, on, off, on. Stop when each setting has at least 3 boots.
+Repeat with the setting alternating from boot to boot: off, on, off, on. Stop when each setting has at least 3 boots. `run` warns when two boots in a row have the same setting, and when WSL or another virtual machine is running.
 
 Keep everything else the same for every boot: the power plan, Microsoft Defender real-time protection, and any other antivirus or filter driver. Filter drivers take most of the time in `syscall_deep`, so a change there hides the kernel stack protection cost.
 
-`run` refuses to start when memory integrity is not running, when the label does not match the system, or when the output file already exists. It pins to logical CPU 2 by default. To use another CPU, pass `--cpu <n>`, and use the same CPU for every run. CPU 0 is not allowed, because it handles most interrupts. On a CPU with performance and efficiency cores, pick a performance core.
+`run` refuses to start when memory integrity is not running, or when kernel stack protection runs in audit mode. It never overwrites a file. Its options:
+
+- `--runs <n>`: runs in this boot, 3 by default.
+- `--dir <folder>`: the results folder, `results` by default.
+- `--cpu <n>`: the logical CPU to pin to, 2 by default. Use the same CPU for every run. CPU 0 is not allowed, because it handles most interrupts. On a CPU with performance and efficiency cores, pick a performance core.
+- `--label <on|off>`: refuse to run unless the system has this setting.
+
+If the Device Guard query fails, run PowerShell as administrator.
 
 ## Compare the runs
 
 ```powershell
-.\kcet-bench.exe compare (Get-ChildItem *.json).FullName
+.\kcet-bench.exe compare
 ```
+
+`compare` reads every run file in `results`. To read other files or folders, name them: `compare D:\old-results on-boot1-run1.json`.
 
 For each test, `compare` prints the median of the run medians for each label, the change from `off` to `on` in percent, and the spread of each label: the lowest and highest run median. A change is "within noise" when the difference between the two medians is smaller than the larger of the two spreads. The verdict needs at least 2 runs per label. The notes under the table name aborted runs, labels with fewer than 3 boots, and runs that mix Windows builds, CPUs, power plans, or pinned CPUs.
 
-`compare` also runs on Linux, so you can read the files from WSL with `cargo run --release -- compare /mnt/c/Users/<you>/kcet-bench/*.json`.
+`compare` also runs on Linux, so you can read the files from WSL with `cargo run --release -- compare /mnt/c/Users/<you>/kcet-bench/results`.
 
 Each run file holds the label, the time, the Windows build, the CPU, the power plan, the `Win32_DeviceGuard` state, every batch's time per unit, and the summary for each test.
 
