@@ -1,0 +1,55 @@
+[package]
+name = "kcet-bench"
+version = "0.1.0"
+edition = "2024"
+description = "Measures what Windows kernel-mode hardware-enforced stack protection (kernel CET shadow stacks) costs"
+license = "MIT"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Wdk_System_SystemServices",
+    "Wdk_System_Threading",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+exit = "warn"
+multiple_unsafe_ops_per_block = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
